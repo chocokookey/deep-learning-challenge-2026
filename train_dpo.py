@@ -1,11 +1,11 @@
 """
-DPO training for Qwen2.5-3B-Instruct — 아주소중한딥러닝챌린지 2026
-Reproduces the `qlora_dpo` adapter (practice 0.734 with the verifier at N=64).
-Verbatim from the working Kaggle cells. GPU T4x2 on Kaggle; training pinned to ONE GPU.
-Install:  pip install -U transformers peft bitsandbytes datasets accelerate  &&  pip install trl==0.12.2
+DPO 학습 코드 — 아주소중한딥러닝챌린지 2026
+실전 0.734 달성에 사용된 `qlora_dpo` 어댑터 재현 코드.
+Kaggle T4x2 환경에서 작성되었으며, 메모리 충돌 방지를 위해 단일 GPU에 할당함.
+설치:  pip install -U transformers peft bitsandbytes datasets accelerate  &&  pip install trl==0.12.2
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"                        # pin to 1 GPU (top of file)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"                        # GPU 1장으로 제한 (무조건 파일 최상단에 위치)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import shutil
@@ -14,7 +14,7 @@ import pandas as pd
 from datasets import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import DPOConfig, DPOTrainer                            # trl==0.12.2
+from trl import DPOConfig, DPOTrainer                            # trl==0.12.2 필수
 
 MODEL_NAME   = "Qwen/Qwen2.5-3B-Instruct"
 VERIFIER_CSV = "/kaggle/input/datasets/h70jun/deeplearning2/verifier_data.csv"
@@ -23,7 +23,7 @@ OUT_DIR      = "/kaggle/working/qlora_dpo"
 SYSTEM_PROMPT = ("You are a careful math problem solver. Solve the problem step by step. "
     "The final answer is always an integer. End your response with the final answer in the format \\boxed{answer}.")
 
-# --- DPO pairs from verifier_data.csv (per question: <=2 correct x <=2 incorrect) ---
+# --- verifier_data.csv에서 DPO 데이터 쌍 추출 (문제당 정답 최대 2개 x 오답 최대 2개) ---
 vdf = pd.read_csv(VERIFIER_CSV)
 print(f"verifier data: {len(vdf)} rows (pos {(vdf['label']==1).sum()}, neg {(vdf['label']==0).sum()})")
 pos_dict = vdf[vdf['label'] == 1].groupby('question')['solution'].apply(list).to_dict()
@@ -36,7 +36,7 @@ for q in pos_dict:
             for ns in neg_dict[q][:2]:
                 dpo_data.append({"question": q, "chosen": ps, "rejected": ns})
 dpo_df = pd.DataFrame(dpo_data)
-print(f"DPO pairs: {len(dpo_df)}")                              # ~1346
+print(f"DPO pairs: {len(dpo_df)}")                              # 약 1346 쌍
 
 tok = AutoTokenizer.from_pretrained(MODEL_NAME)
 tok.padding_side = "right"
@@ -52,7 +52,7 @@ def format_dpo(row):
 raw_ds = Dataset.from_pandas(dpo_df)
 dpo_ds = raw_ds.map(format_dpo, remove_columns=raw_ds.column_names).shuffle(seed=42)
 
-# --- model (4-bit QLoRA) ---
+# --- 모델 로드 (4-bit QLoRA) ---
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True, bnb_4bit_quant_type="nf4",
     bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
@@ -67,8 +67,8 @@ lora_config = LoraConfig(
 model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 
-# gradient_checkpointing + use_reentrant=False  -> fixes the CUBLAS / illegal-memory crash
-# processing_class=tok (NOT tokenizer=)         -> required by trl 0.12.2
+# gradient_checkpointing + use_reentrant=False  -> CUBLAS / 메모리 접근 에러(illegal-memory) 해결 핵심 옵션
+# processing_class=tok (tokenizer 아님)         -> trl 0.12.2 버전 문법 적용
 dpo_config = DPOConfig(
     output_dir=OUT_DIR,
     num_train_epochs=1,
@@ -89,9 +89,9 @@ dpo_config = DPOConfig(
 trainer = DPOTrainer(model=model, ref_model=None, args=dpo_config,
                      train_dataset=dpo_ds, processing_class=tok)
 model.config.use_cache = False
-trainer.train()                                                 # ~84 steps -> checkpoint-84
+trainer.train()                                                 # 배치 크기 1, 누적 16 기준 약 84스텝 (checkpoint-84)
 trainer.save_model(OUT_DIR)
 
-# Back up as a Kaggle Dataset:  Output -> New Dataset  AND  Add as Input (both steps!)
+# Kaggle Dataset으로 백업: Output 탭 -> New Dataset 생성 후 실전 노트북에 Add Input 필수
 shutil.make_archive("/kaggle/working/qlora_dpo_backup", "zip", OUT_DIR)
 print("saved:", OUT_DIR)
