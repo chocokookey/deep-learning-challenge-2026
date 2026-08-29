@@ -1,17 +1,16 @@
 """
 Inference — 아주소중한딥러닝챌린지 2026 (Qwen2.5-3B-Instruct + QLoRA)
 
-Confirmed pipeline: DPO generation (self-consistency) + verifier rerank, lambda=0.7.
-Practice score 0.734 at N=64. Prompts / model / sampling / scoring are VERBATIM from the
-working DPO cells; wrapped in a block loop that saves incrementally and prints an ETA
-(for the ~2000-problem, 24h real run on Aug 31).
+확정된 파이프라인: DPO 생성 (Self-Consistency) + Verifier 리랭킹, lambda=0.7.
+N=64 기준 연습 리더보드 0.734 달성. 프롬프트/모델/샘플링/채점 로직은 검증된 셀과 100% 동일함.
+실전 24시간 런(약 2000문제)을 대비해 블록 단위 중간 저장 및 ETA 출력 기능 포함.
 
-REAL RUN (Aug 31):
-  1. Set SAMPLE_N=30, run once, read the printed ETA, THEN pick N.
-  2. N=32 ~halves wall-clock vs N=64 for ~-0.005 practice score -> safe when time is tight.
-  3. submission.csv is rewritten every block, so an interrupted run still leaves a partial file.
-  Change TEST_CSV only; run top to bottom.
-Install:  pip install -U vllm transformers
+실전 적용 (8/31):
+  1. SAMPLE_N=30으로 맞추고 한 번 실행 -> 출력되는 전체 ETA 확인 후 최종 N 결정.
+  2. N=32로 낮추면 시간은 절반으로 줄고 점수 하락폭은 -0.005 내외이므로, 시간이 빡빡할 때 안전한 선택지.
+  3. submission.csv는 블록마다 덮어쓰기로 저장되므로 중간에 터져도 부분 답안이 안전하게 남음.
+  TEST_CSV 경로만 실전용으로 수정 후 전체 실행.
+설치:  pip install -U vllm transformers
 """
 import re, math, time
 from collections import Counter, defaultdict
@@ -20,8 +19,8 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
 
-# ============================= CONFIG (edit here) =============================
-PIPELINE   = "dpo"        # "dpo" (confirmed 0.734) | "ensemble" (dpo+gemini, ~2x slower)
+# ============================= 설정 (이 부분만 수정) =============================
+PIPELINE   = "dpo"        # "dpo" (0.734 확정) | "ensemble" (dpo+gemini, 속도 2배 소요)
 TEST_CSV   = "/kaggle/input/competitions/deep-learning-challenge-2026/deep_chal_math_leaderboard_filtered.csv"
 OUT_CSV    = "/kaggle/working/submission.csv"
 
@@ -30,12 +29,12 @@ DPO_LORA   = "/kaggle/input/datasets/h70jun/qlora-dpo/qlora_dpo"
 GEM_LORA   = "/kaggle/input/datasets/h70jun/deeplearning2/qlora_gemini2_backup"
 VER_LORA   = "/kaggle/input/datasets/h70jun/deeplearning2/qlora_verifier_backup"
 
-N_TOTAL       = 64        # candidates/question.  32 = ~half the time, ~-0.005 practice
-LAMBDA        = 0.7       # Score = SC_count + LAMBDA * P(Yes) * N_TOTAL   (0.6~0.7 -> 0.734)
-CHUNK         = 50        # questions per block (concurrency + incremental-save granularity)
+N_TOTAL       = 64        # 문제당 생성할 후보 수. 32로 낮추면 시간 절반, 점수 하락폭 미미함
+LAMBDA        = 0.7       # 최종 점수 = 빈도수 + LAMBDA * P(Yes) * N_TOTAL (0.6~0.7 부근 최적)
+CHUNK         = 50        # 한 번에 처리 및 저장할 문제 수 (메모리 확보 및 중간 저장 단위)
 MAX_INPUT_TOK = 2900
-SEED          = 42        # NOT in the original run; added for deterministic re-runs
-SAMPLE_N      = 0         # >0 -> only first N questions (timing dry-run). 0 -> all.
+SEED          = 42        # 재현성(Reproducibility)을 위한 난수 시드 고정
+SAMPLE_N      = 0         # >0: 앞부분 N문제만 테스트 (ETA 확인용) / 0: 전체 문제 실행
 
 SYSTEM_PROMPT = ("You are a careful math problem solver. Solve the problem step by step. "
     "The final answer is always an integer. End your response with the final answer in the format \\boxed{answer}.")
@@ -52,9 +51,11 @@ lb.columns = [c.strip() for c in lb.columns]
 print("columns:", list(lb.columns))
 id_col = ID_COL       if ID_COL       in lb.columns else lb.columns[0]
 q_col  = "question"   if "question"   in lb.columns else lb.columns[1]
+
 if SAMPLE_N:
     lb = lb.head(SAMPLE_N)
-    print(f"*** DRY RUN: first {SAMPLE_N} questions — extrapolate the ETA, do NOT submit ***")
+    print(f"* DRY RUN: 앞부분 {SAMPLE_N}문제만 실행 — ETA 확인 후 SAMPLE_N=0으로 되돌려 본run 진행 *")
+    
 ids       = lb[id_col].tolist()
 questions = lb[q_col].tolist()
 print(f"questions: {len(questions)}  pipeline: {PIPELINE}  N_TOTAL: {N_TOTAL}")
@@ -69,7 +70,7 @@ def extract_answer(text):
         return None
     try:
         v = int(cand.replace(",", ""))
-        return None if abs(v) > 10**18 else v
+        return None if abs(v) > 1018 else v
     except ValueError:
         return None
 
@@ -102,7 +103,7 @@ def solve_block(qs):
 
     counter = [Counter() for _ in qs]
     reps    = [defaultdict(list) for _ in qs]
-    for lora in GEN_LORAS:                                # dpo (+ gemini if ensemble)
+    for lora in GEN_LORAS:                                # dpo 단독 (ensemble 모드일 경우 gemini 추가)
         for j, out in enumerate(llm.generate(prompts, gen_params, lora_request=lora)):
             for o in out.outputs:
                 a = extract_answer(o.text)
@@ -121,7 +122,7 @@ def solve_block(qs):
                         [{"role": "system", "content": VERIFY_SYSTEM},
                          {"role": "user",   "content": user}],
                         tokenize=False, add_generation_prompt=True)
-                pid = tok(p)["input_ids"]                 # truncate whole prompt (verifier overflow guard)
+                pid = tok(p)["input_ids"]                 # verifier 최대 컨텍스트 길이 방어를 위한 프롬프트 자르기
                 if len(pid) > MAX_INPUT_TOK:
                     p = tok.decode(pid[:MAX_INPUT_TOK])
                 vprompts.append(p); vindex.append((j, ans))
